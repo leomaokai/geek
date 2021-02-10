@@ -313,3 +313,150 @@ HashMap 内部的结构，它可以看作是数组（Node[] table）和链表结
 
 ## Java 提供了哪些 IO 方式？ NIO 如何实现多路复用？
 
+第一，传统的 java.io 包，它基于流模型实现，提供了我们最熟知的一些 IO 功能，比如 File 抽象、输入输出流等。交互方式是同步、阻塞的方式，也就是说，在读取输入流或者写入输出流时，在读、写动作完成之前，线程会一直阻塞在那里，它们之间的调用是可靠的线性顺序。java.io 包的好处是代码比较简单、直观，缺点则是 IO 效率和扩展性存在局限性，容易成为应用性能的瓶颈。
+
+第二，在 Java 1.4 中引入了 NIO 框架（java.nio 包），提供了 Channel、Selector、Buffer 等新的抽象，可以构建多路复用的、同步非阻塞 IO 程序，同时提供了更接近操作系统底层的高性能数据操作方式。
+
+第三，在 Java 7 中，NIO 有了进一步的改进，也就是 NIO 2，引入了异步非阻塞 IO 方式，也有很多人叫它 AIO（Asynchronous IO）。异步 IO 操作基于事件和回调机制，可以简单理解为，应用操作直接返回，而不会阻塞在那里，当后台处理完成，操作系统会通知相应线程进行后续工作。
+
+```markdown
+# 区分同步和异步
+- 同步是一种可靠的有序运行机制，当我们进行同步操作时，后续的任务是等待当前调用返回，才会进行下一步
+- 而异步则相反，其他任务不需要等待当前调用返回，通常依靠事件、回调等机制来实现任务间次序关系。
+# 区分阻塞和非阻塞
+- 在进行阻塞操作时，当前线程会处于阻塞状态，无法从事其他任务，只有当条件就绪才能继续，比如 ServerSocket 新连接建立完毕，或数据读取、写入操作完成
+- 而非阻塞则是不管 IO 操作是否结束，直接返回，相应操作在后台继续处理。
+```
+
+![image-20210210172056406](Java核心技术.assets/image-20210210172056406.png)
+
+```markdown
+# NIO
+- Buffer，高效的数据容器，除了布尔类型，所有原始数据类型都有相应的 Buffer 实现
+- Channel，类似在 Linux 之类操作系统上看到的文件描述符，是 NIO 中被用来支持批量式 IO 操作的一种抽象。
+- Selector，是 NIO 实现多路复用的基础，它提供了一种高效的机制，可以检测到注册在 Selector 上的多个 Channel 中，是否有 Channel 处于就绪状态，进而实现了单线程对多 Channel 的高效管理
+- Charset，提供 Unicode 字符串定义，NIO 也提供了相应的编解码器等
+```
+
+![image-20210210173136096](Java核心技术.assets/image-20210210173136096.png)
+
+## Java 有几种文件拷贝方式？哪一种最高效？
+
+```java
+// 常规实现
+public static void copyFileByStream(File source, File dest) {
+    try (InputStream is = new FileInputStream(source);
+         OutputStream os = new FileOutputStream(dest);){
+        byte[] buffer = new byte[1024];
+        int length;
+        while ((length = is.read(buffer)) > 0) {
+            os.write(buffer, 0, length);
+        }
+    }
+}
+// NIO
+public static void copyFileByChannel(File source, File dest){
+    try (FileChannel sourceChannel = new FileInputStream(source).getChannel();
+         FileChannel targetChannel = new FileOutputStream(dest).getChannel();){
+        for (long count = sourceChannel.size() ;count>0 ;) {
+            long transferred =sourceChannel.transferTo(sourceChannel.position(),count,targetChannel);
+            sourceChannel.position(sourceChannel.position() + transferred);
+            count -= transferred;
+        }
+    }
+}
+```
+
+常规实现
+
+![image-20210210182802674](Java核心技术.assets/image-20210210182802674.png)
+
+NIO transferTo  零拷贝
+
+![image-20210210182913202](Java核心技术.assets/image-20210210182913202.png)
+
+```markdown
+# 如何提高类似拷贝等 IO 操作的性能
+- 在程序中，使用缓存等机制，合理减少 IO 次数（在网络通信中，如 TCP 传输，window 大小也可以看作是类似思路）。
+- 使用 transferTo 等机制，减少上下文切换和额外 IO 操作。
+- 尽量减少不必要的转换过程，比如编解码；对象序列化和反序列化，比如操作文本文件或者网络通信，如果不是过程中需要使用文本信息，可以考虑不要将二进制信息转换成字符串，直接传输二进制信息。
+```
+
+```markdown
+# 掌握 NIO Buffer
+## Buffer 的基本属性
+- capacity，它反映这个 Buffer 到底有多大，也就是数组的长度。
+- position，要操作的数据起始位置。
+- limit，相当于操作的限额。在读取或者写入时，limit 的意义很明显是不一样的。比如，读取操作时，很可能将 limit 设置到所容纳数据的上限；而在写入时，则会设置容量或容量以下的可写限度。
+- mark，记录上一次 postion 的位置，默认是 0，算是一个便利性的考虑，往往不是必须的。
+## Buffer 的基本操作
+- 我们创建了一个 ByteBuffer，准备放入数据，capacity 当然就是缓冲区大小，而 position 就是 0，limit 默认就是 capacity 的大小。
+- 当我们写入几个字节的数据时，position 就会跟着水涨船高，但是它不可能超过 limit 的大小。
+- 如果我们想把前面写入的数据读出来，需要调用 flip 方法，将 position 设置为 0，limit 设置为以前的 position 那里。
+- 如果还想从头再读一遍，可以调用 rewind，让 limit 不变，position 再次设置为 0。
+```
+
+## 谈谈接口和抽象类有什么区别？
+
+接口是对行为的抽象，它是抽象方法的集合，利用接口可以达到 API 定义和实现分离的目的。接口，不能实例化；不能包含任何非常量成员，任何 field 都是隐含着 public static final 的意义；同时，没有非静态方法实现，也就是说要么是抽象方法，要么是静态方法。Java 标准类库中，定义了非常多的接口，比如 java.util.List。
+
+抽象类是不能实例化的类，用 abstract 关键字修饰 class，其目的主要是代码重用。除了不能实例化，形式上和一般的 Java 类并没有太大区别，可以有一个或者多个抽象方法，也可以没有抽象方法。抽象类大多用于抽取相关 Java 类的共用方法实现或者是共同成员变量，然后通过继承的方式达到代码复用的目的。Java 标准库中，比如 collection 框架，很多通用部分就被抽取成为抽象类，例如 java.util.AbstractList。
+
+Java 8 增加了函数式编程的支持，所以又增加了一类定义，即所谓 functional interface，简单说就是只有一个抽象方法的接口，通常建议使用 @FunctionalInterface Annotation 来标记。Lambda 表达式本身可以看作是一类 functional interface
+
+```markdown
+# 面向对象设计
+## 封装,继承,多态
+- 封装的目的是隐藏事务内部的实现细节，以便提高安全性和简化编程。封装提供了合理的边界，避免外部调用者接触到内部的细节。
+- 继承是代码复用的基础机制,继承可以看作是非常紧耦合的一种关系，父类代码修改，子类行为也会变动。在实践中，过度滥用继承，可能会起到反效果。
+- 多态，你可能立即会想到重写（override）和重载（overload）、向上转型。简单说，重写是父子类中相同名字和参数的方法，不同的实现；重载则是相同名字的方法，但是不同的参数，本质上这些方法签名是不一样的.
+# S.O.L.I.D 原则
+- 单一职责（Single Responsibility），类或者对象最好是只有单一职责，在程序设计中如果发现某个类承担着多种义务，可以考虑进行拆分。
+- 开关原则（Open-Close, Open for extension, close for modification），设计要对扩展开放，对修改关闭。换句话说，程序设计应保证平滑的扩展性，尽量避免因为新增同类功能而修改已有实现，这样可以少产出些回归（regression）问题。
+- 里氏替换（Liskov Substitution），这是面向对象的基本要素之一，进行继承关系抽象时，凡是可以用父类或者基类的地方，都可以用子类替换。
+- 接口分离（Interface Segregation），我们在进行类和接口设计时，如果在一个接口里定义了太多方法，其子类很可能面临两难，就是只有部分方法对它是有意义的，这就破坏了程序的内聚性。对于这种情况，可以通过拆分成功能单一的多个接口，将行为进行解耦。在未来维护中，如果某个接口设计有变，不会对使用其他接口的子类构成影响。
+- 依赖反转（Dependency Inversion），实体应该依赖于抽象而不是实现。也就是说高层次模块，不应该依赖于低层次模块，而是应该基于抽象。实践这一原则是保证产品代码之间适当耦合度的法宝。
+```
+
+## 谈谈你知道的设计模式？
+
+设计模式可以分为创建型模式、结构型模式和行为型模式
+
+创建型模式，是对对象创建过程的各种问题和解决方案的总结：
+
+* 各种工厂模式（Factory、Abstract Factory）
+* 单例模式（Singleton）
+* 构建器模式（Builder）
+* 原型模式（Proto Type）
+
+结构型模式，是对软件设计结构的总结，关注于类、对象继承、组合方式的实践经验
+
+* 桥接模式（Bridge）
+* 适配器模式（Adapter）
+* 装饰者模式（Decorator）
+* 代理模式（Proxy）
+* 组合模式（Composite）
+* 外观模式（Facade）
+* 享元模式（Flyweight）
+
+行为型模式，是从类或对象之间交互、职责划分等角度总结的模式
+
+* 策略模式（Strategy）
+* 解释器模式（Interpreter）
+* 命令模式（Command）
+* 观察者模式（Observer）
+* 迭代器模式（Iterator）
+* 模板方法模式（Template Method）
+* 访问者模式（Vistor）
+
+```markdown
+# Spring 中使用到的设计模式
+- BeanFactory和ApplicationContext应用了工厂模式。
+- 在 Bean 的创建中，Spring 也为不同 scope 定义的对象，提供了单例和原型等模式实现。
+- AOP 领域则是使用了代理模式、装饰器模式、适配器模式等。
+- 各种事件监听器，是观察者模式的典型应用
+- 类似 JdbcTemplate 等则是应用了模板模式
+```
+
+# 进阶
+
