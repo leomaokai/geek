@@ -1150,3 +1150,828 @@ wait/notify 的使用导致了较多的上下文切换
 
 很多 JVM 垃圾回收器（serial 收集器、ParNew 收集器）在回收旧对象时，会产生内存碎片，从而需要进行内存整理，在这个过程中就需要移动存活的对象。而移动内存对象就意味着这些对象所在的内存地址会发生变化，因此在移动对象前需要暂停线程，在移动完成后需要再次唤醒该线程。因此减少 JVM 垃圾回收的频率可以有效地减少上下文切换。
 
+## 识别不同场景下最优容器
+
+### 并发场景下的 Map 容器
+
+为了保证容器的线程安全，Java 实现了 Hashtable、ConcurrentHashMap 以及 ConcurrentSkipListMap 等 Map 容器。
+
+Hashtable、ConcurrentHashMap 是基于 HashMap 实现的，对于小数据量的存取比较有优势。
+
+ConcurrentSkipListMap 是基于 TreeMap 的设计原理实现的，略有不同的是前者基于跳表实现，后者基于红黑树实现，ConcurrentSkipListMap 的特点是存取平均时间复杂度是 O（log（n）），适用于大数据量存取的场景，最常见的是基于跳跃表实现的数据量比较大的缓存。
+
+> Hashtable 🆚 ConcurrentHashMap
+
+Hashtable 使用 Synchronized 同步锁修饰了 put、get、remove 等方法，因此在高并发场景下，读写操作都会存在大量锁竞争，给系统带来性能开销。
+
+相比 Hashtable，ConcurrentHashMap 在保证线程安全的基础上兼具了更好的并发性能。在 JDK1.7 中，ConcurrentHashMap 就使用了分段锁 Segment 减小了锁粒度，最终优化了锁的并发操作。
+
+到了 JDK1.8，ConcurrentHashMap 做了大量的改动，摒弃了 Segment 的概念。由于 Synchronized 锁在 Java6 之后的性能已经得到了很大的提升，所以在 JDK1.8 中，Java 重新启用了 Synchronized 同步锁，通过 Synchronized 实现 HashEntry 作为锁粒度。这种改动将数据结构变得更加简单了，操作也更加清晰流畅。
+
+与 JDK1.7 的 put 方法一样，JDK1.8 在添加元素时，在没有哈希冲突的情况下，会使用 CAS 进行添加元素操作；如果有冲突，则通过 Synchronized 将链表锁定，再执行接下来的操作。
+
+ConcurrentHashMap 中的 get、size 等方法没有用到锁，ConcurrentHashMap 是弱一致性的
+
+> ConcurrentHashMap 🆚 ConcurrentSkipListMap
+
+ConcurrentHashMap 容器在数据量比较大的时候，链表会转换为红黑树。红黑树在并发情况下，删除和插入过程中有个平衡的过程，会牵涉到大量节点，因此竞争锁资源的代价相对比较高。
+
+如果对数据有强一致要求，则需使用 Hashtable；在大部分场景通常都是弱一致性的情况下，使用 ConcurrentHashMap 即可；如果数据量在千万级别，且存在大量增删改操作，则可以考虑使用 ConcurrentSkipListMap。并发场景下的 List 容器
+
+### 并发场景下的 List 容器
+
+Java 在并发编程中提供的线程安全数组，包括 Vector 和 CopyOnWriteArrayList。
+
+Vector 也是基于 Synchronized 同步锁实现的线程安全，Synchronized 关键字几乎修饰了所有对外暴露的方法，所以在读远大于写的操作场景中，Vector 将会发生大量锁竞争，从而给系统带来性能开销。
+
+CopyOnWriteArrayList 是 java.util.concurrent 包提供的方法，它实现了读操作无锁，写操作则通过操作底层数组的新副本来实现，是一种读写分离的并发策略。
+
+### 总结
+
+![image-20210215102743071](Java性能调优.assets/image-20210215102743071.png)
+
+## 如何设置线程池大小？
+
+### 线程池原理
+
+大量创建线程同样会给系统带来性能问题，因为内存和 CPU 资源都将被线程抢占，如果处理不当，就会发生内存溢出、CPU 使用率超负荷等问题。
+
+对于频繁创建线程的业务场景，线程池可以创建固定的线程数量，并且在操作系统底层，轻量级进程将会把这些线程映射到内核。
+
+### 线程池框架 Executor
+
+Executors 实现了以下四种类型的 ThreadPoolExecutor：
+
+![image-20210215103341592](Java性能调优.assets/image-20210215103341592.png)
+
+建议使用 ThreadPoolExecutor 自我定制一套线程池。
+
+```java
+public ThreadPoolExecutor(
+    //线程池的核心线程数量
+	int corePoolSize,
+    //线程池的最大线程数
+	int maximumPoolSize,
+    //当线程数大于核心线程数时，多余的空闲线程存活的最长时间
+	long keepAliveTime,
+    //时间单位
+	TimeUnit unit,
+    //任务队列，用来储存等待执行任务的队列
+	BlockingQueue<Runnable> workQueue,
+    //线程工厂，用来创建线程，一般默认即可
+	ThreadFactory threadFactory,
+     //拒绝策略
+	RejectedExecutionHandler handler)
+```
+
+![image-20210215103735344](Java性能调优.assets/image-20210215103735344.png)
+
+当创建的线程数等于 corePoolSize 时，提交的任务会被加入到设置的阻塞队列中。当队列满了，会创建线程执行任务，直到线程池中的数量等于 maximumPoolSize。
+
+当线程数量已经等于 maximumPoolSize 时， 新提交的任务无法加入到等待队列，也无法创建非核心线程直接执行，我们又没有为线程池设置拒绝策略，这时线程池就会抛出 RejectedExecutionException 异常，即线程池拒绝接受这个任务。
+
+当线程池中创建的线程数量超过设置的 corePoolSize，在某些线程处理完任务后，如果等待 keepAliveTime 时间后仍然没有新的任务分配给它，那么这个线程将会被回收。
+
+<img src="Java性能调优.assets/image-20210215104202159.png" alt="image-20210215104202159" style="zoom:75%;" />
+
+### 计算线程数量
+
+一般多线程执行的任务类型可以分为 CPU 密集型和 I/O 密集型，根据不同的任务类型，我们计算线程数的方法也不一样。
+
+**CPU 密集型任务**：这种任务消耗的主要是 CPU 资源，可以将线程数设置为 N（CPU 核心数）+1，比 CPU 核心数多出来的一个线程是为了防止线程偶发的缺页中断，或者其它原因导致的任务暂停而带来的影响。一旦任务暂停，CPU 就会处于空闲状态，而在这种情况下多出来的一个线程就可以充分利用 CPU 的空闲时间。
+
+**I/O 密集型任务**：这种任务应用起来，系统会用大部分的时间来处理 I/O 交互，而线程在处理 I/O 的时间段内不会占用 CPU 来处理，这时就可以将 CPU 交出给其它线程使用。因此在 I/O 密集型任务的应用中，我们可以多配置一些线程，具体的计算方法是 2N。
+
+## 如何用协程来优化多线程业务？
+
+协程和线程密切相关，协程可以认为是运行在线程上的代码块，协程提供的挂起操作会使协程暂停执行，而不会导致线程阻塞。
+
+协程又是一种轻量级资源，即使创建了上千个协程，对于系统来说也不是很大的负担，但如果在程序中创建上千个线程，那系统可真就压力山大了。可以说，协程的设计方式极大地提高了线程的使用率。
+
+# JVM性能监测及调试
+
+## 了解JVM内存模型
+
+JVM 不仅承担了 Java 字节码的分析（JIT compiler）和执行（Runtime），同时也内置了自动内存分配管理机制。
+
+### JVM 内存模型的具体设计
+
+在 Java 中，JVM 内存模型主要分为堆、程序计数器、方法区、虚拟机栈和本地方法栈。
+
+![image-20210215125857847](Java性能调优.assets/image-20210215125857847.png)
+
+> 堆
+
+![image-20210215125941393](Java性能调优.assets/image-20210215125941393.png)
+
+堆是 JVM 内存中最大的一块内存空间，该内存被所有线程共享，几乎所有对象和数组都被分配到了堆内存中。堆被划分为新生代和老年代，新生代又被进一步划分为 Eden 和 Survivor 区，最后 Survivor 由 From Survivor 和 To Survivor 组成。
+
+在 Java6 版本中，永久代在非堆内存区；到了 Java7 版本，永久代的静态变量和运行时常量池被合并到了堆中；而到了 Java8，永久代被元空间取代了。
+
+元空间(非堆)，，用来存放一些JDK自身携带的Class对象、Interface元数据，存储的是Java运行时的一些环境或类信息，不存在垃圾回收，关闭虚拟机就会释放这个区域的内存。
+
+> 程序计数器（Program Counter Register）
+
+程序计数器是一块很小的内存空间，主要用来记录各个线程执行的字节码的地址，例如，分支、循环、跳转、异常、线程恢复等都依赖于计数器。
+
+> 方法区（Method Area）
+
+方法区（目前为元空间）主要是用来存放已被虚拟机加载的类相关信息，包括类信息、运行时常量池、字符串常量池。类信息又包括了类的版本、字段、方法、接口和父类等信息。
+
+方法区与堆空间类似，也是一个共享内存区，所以方法区是线程共享的。
+
+Java8 版本已经将方法区中实现的永久代去掉了，并用元空间（class metadata）代替了之前的永久代，并且元空间的存储位置是本地内存。之前永久代的类的元数据存储在了元空间，永久代的静态变量（class static variables）以及运行时常量池（runtime constant pool）则跟 Java7 一样，转移到了堆中。
+
+```markdown
+# Java8 为什么使用元空间替代永久代，这样做有什么好处呢？
+- 移除永久代是为了融合 HotSpot JVM 与 JRockit VM 而做出的努力，因为 JRockit 没有永久代，所以不需要配置永久代。
+- 永久代内存经常不够用或发生内存溢出，爆出异常 java.lang.OutOfMemoryError: PermGen。这是因为在 JDK1.7 版本中，指定的 PermGen 区大小为 8M，由于 PermGen 中类的元数据信息在每次 FullGC 的时候都可能被收集，回收率都偏低，成绩很难令人满意；还有，为 PermGen 分配多大的空间很难确定，PermSize 的大小依赖于很多因素，比如，JVM 加载的 class 总数、常量池的大小和方法的大小等。
+```
+
+> 虚拟机栈（VM stack）
+
+Java 虚拟机栈是线程私有的内存空间，它和 Java 线程一起创建。当创建一个线程时，会在虚拟机栈中申请一个线程栈，用来保存方法的局部变量、操作数栈、动态链接方法和返回地址等信息，并参与方法的调用和返回。每一个方法的调用都伴随着栈帧的入栈操作，方法的返回则是栈帧的出栈操作。
+
+> 本地方法栈（Native Method Stack）
+
+本地方法栈跟 Java 虚拟机栈的功能类似，Java 虚拟机栈用于管理 Java 函数的调用，而本地方法栈则用于管理本地方法的调用。但本地方法并不是用 Java 实现的，而是由 C 语言实现的。
+
+### JVM 的运行原理
+
+## 深入JVM即时编译器JIT，优化Java编译
+
+# 设计模式调优
+
+## 单例模式：如何创建单一对象优化系统性能？
+
+单例模式有三个基本要点：一是这个类只能有一个实例；二是它必须自行创建这个实例；三是它必须自行向整个系统提供这个实例。
+
+通过单例模式，我们可以避免多次创建多个实例，从而节约系统资源。
+
+### 饿汉模式
+
+```java
+//饿汉模式
+public final class Singleton {
+    private static Singleton instance=new Singleton();//自行创建实例
+    private Singleton(){}//构造函数
+    public static Singleton getInstance(){//通过该函数向整个系统提供实例
+        return instance;
+    }
+}
+```
+
+饿汉模式实现的单例的优点是，可以保证多线程情况下实例的唯一性，而且 getInstance 直接返回唯一实例，性能非常高。
+
+然而，在类成员变量比较多，或变量比较大的情况下，这种模式可能会在没有使用类对象的情况下，一直占用堆内存。
+
+### 懒汉模式
+
+懒汉模式就是为了避免直接加载类对象时提前创建对象的一种单例设计模式。该模式使用懒加载方式，只有当系统使用到类对象时，才会将实例加载到堆内存中。
+
+```java
+//懒汉模式
+public final class Singleton {
+    private static Singleton instance= null;//不实例化
+    private Singleton(){}//构造函数
+    public static Singleton getInstance(){//通过该函数向整个系统提供实例
+        if(null == instance){//当instance为null时，则实例化对象，否则直接返回对象
+            instance = new Singleton();//实例化对象
+        }
+        return instance;//返回已存在的对象
+    }
+}
+
+//懒汉模式 + synchronized同步锁
+public final class Singleton {
+    private static Singleton instance= null;//不实例化
+    private Singleton(){}//构造函数
+    public static synchronized Singleton getInstance(){//加同步锁，通过该函数向整个系统提供实例
+        if(null == instance){//当instance为null时，则实例化对象，否则直接返回对象
+            instance = new Singleton();//实例化对象
+        }
+        return instance;//返回已存在的对象
+    }
+}
+
+//懒汉模式 + synchronized同步锁
+public final class Singleton {
+    private static Singleton instance= null;//不实例化
+    private Singleton(){}//构造函数
+    public static Singleton getInstance(){//加同步锁，通过该函数向整个系统提供实例
+        if(null == instance){//当instance为null时，则实例化对象，否则直接返回对象
+            synchronized (Singleton.class){
+                instance = new Singleton();//实例化对象
+            } 
+        }
+        return instance;//返回已存在的对象
+    }
+}
+// 以上单例模式都不安全
+// 需要双重检测锁模式的单例模式
+
+//懒汉模式 + synchronized同步锁 + double-check
+public final class Singleton {
+    private static Singleton instance= null;//不实例化
+    private Singleton(){}//构造函数
+    public static Singleton getInstance(){//加同步锁，通过该函数向整个系统提供实例
+        if(null == instance){//第一次判断，当instance为null时，则实例化对象，否则直接返回对象
+            synchronized (Singleton.class){//同步锁
+                if(null == instance){//第二次判断
+                    instance = new Singleton();//实例化对象
+                }
+            } 
+        }
+        return instance;//返回已存在的对象
+    }
+}
+
+//懒汉模式 + synchronized同步锁 + double-check + volatile
+public final class Singleton {
+    private volatile static Singleton instance= null;//不实例化
+    public List<String> list = null;//list属性
+    private Singleton(){
+        list = new ArrayList<String>();
+    }//构造函数
+    public static Singleton getInstance(){//加同步锁，通过该函数向整个系统提供实例
+        if(null == instance){//第一次判断，当instance为null时，则实例化对象，否则直接返回对象
+            synchronized (Singleton.class){//同步锁
+                if(null == instance){//第二次判断
+                    instance = new Singleton();//实例化对象
+                }
+            } 
+        }
+        return instance;//返回已存在的对象
+    }
+}
+
+//懒汉模式 内部类实现
+public final class Singleton {
+    public List<String> list = null;// list属性
+
+    private Singleton() {//构造函数
+        list = new ArrayList<String>();
+    }
+
+    // 内部类实现
+    public static class InnerSingleton {
+        private static Singleton instance=new Singleton();//自行创建实例
+    }
+
+    public static Singleton getInstance() {
+        return InnerSingleton.instance;// 返回内部类中的静态变量
+    }
+}
+
+// 枚举也是一个Class类,默认单例,且不会被反射破解
+public enum EnumSingle {
+    INSTANCE;
+
+    public EnumSingle getInstance(){
+        return INSTANCE;
+    }
+}
+```
+
+## 原型模式与享元模式：提升系统性能的利器
+
+原型模式和享元模式，前者是在创建多个实例时，对创建过程的性能进行调优；后者是用减少创建实例的方式，来调优系统性能。
+
+### 原型模式
+
+原型模式是通过给出一个原型对象来指明所创建的对象的类型，然后使用自身实现的克隆接口来复制这个原型对象，该模式就是用这种方式来创建出更多同类型的对象。
+
+使用这种方式创建新的对象的话，就无需再通过 new 实例化来创建对象了。这是因为 Object 类的 clone 方法是一个本地方法，它可以直接操作内存中的二进制流，所以性能相对 new 实例化来说，更佳。
+
+```java
+
+//实现Cloneable 接口的原型抽象类Prototype 
+class Prototype implements Cloneable {
+    //重写clone方法
+    public Prototype clone(){
+        Prototype prototype = null;
+        try{
+            prototype = (Prototype)super.clone();
+        }catch(CloneNotSupportedException e){
+            e.printStackTrace();
+        }
+        return prototype;
+    }
+}
+//实现原型类
+class ConcretePrototype extends Prototype{
+    public void show(){
+        System.out.println("原型模式实现类");
+    }
+}
+
+public class Client {
+    public static void main(String[] args){
+        ConcretePrototype cp = new ConcretePrototype();
+        for(int i=0; i< 10; i++){
+            ConcretePrototype clonecp = (ConcretePrototype)cp.clone();
+            clonecp.show();
+        }
+    }
+}
+```
+
+```markdown
+# 要实现一个原型类，需要具备三个条件：
+- 实现 Cloneable 接口：Cloneable 接口与序列化接口的作用类似，它只是告诉虚拟机可以安全地在实现了这个接口的类上使用 clone 方法。在 JVM 中，只有实现了 Cloneable 接口的类才可以被拷贝，否则会抛出 CloneNotSupportedException 异常。
+- 重写 Object 类中的 clone 方法：在 Java 中，所有类的父类都是 Object 类，而 Object 类中有一个 clone 方法，作用是返回对象的一个拷贝。
+- 在重写的 clone 方法中调用 super.clone()：默认情况下，类不具备复制对象的能力，需要调用 super.clone() 来实现。
+```
+
+从上面我们可以看出，原型模式的主要特征就是使用 clone 方法复制一个对象。通常，有些人会误以为 Object a=new Object();Object b=a; 这种形式就是一种对象复制的过程，然而这种复制只是对象引用的复制，也就是 a 和 b 对象指向了同一个内存地址，如果 b 修改了，a 的值也就跟着被修改了（浅拷贝）。
+
+通过 clone 方法复制的对象才是真正的对象复制，clone 方法赋值的对象完全是一个独立的对象。
+
+> 深拷贝和浅拷贝
+
+**简单调用 super.clone() 这种克隆对象方式**，会创建当前对象所属类的一个新对象，并对该对象进行初始化，使得新对象的成员变量的值与当前对象的成员变量的值一模一样，但对于其它对象的引用以及 List 等类型的成员属性，则只能复制这些对象的引用了，**是一种浅拷贝**。
+
+```java
+
+//定义学生类
+class Student implements Cloneable{  
+    private String name; //学生姓名
+    private Teacher teacher; //定义老师类
+
+    public String getName() {  
+        return name;  
+    }  
+
+    public void setName(String name) {  
+        this.name = name;  
+    } 
+
+    public Teacher getTeacher() {  
+        return teacher;  
+    }  
+
+    public void setTeacher(Teacher teacher) {  
+        this.teacher = teacher;  
+    } 
+    //重写克隆方法,浅拷贝
+    /**
+        public Student clone() { 
+        Student student = null; 
+        try { 
+            student = (Student) super.clone(); 
+        } catch (CloneNotSupportedException e) { 
+            e.printStackTrace(); 
+        } 
+        return student; 
+    }
+    */
+    // 深拷贝写法
+    public Student clone() { 
+        Student student = null; 
+        try { 
+            student = (Student) super.clone();
+            //克隆teacher对象
+            Teacher teacher = this.teacher.clone();
+            student.setTeacher(teacher);
+        } catch (CloneNotSupportedException e) { 
+            e.printStackTrace(); 
+        } 
+        return student; 
+    } 
+
+}  
+
+//定义老师类
+class Teacher implements Cloneable{  
+    private String name;  //老师姓名
+
+    public String getName() {  
+        return name;  
+    }  
+
+    public void setName(String name) {  
+        this.name= name;  
+    } 
+
+    //重写克隆方法，堆老师类进行克隆
+    public Teacher clone() { 
+        Teacher teacher= null; 
+        try { 
+            teacher= (Teacher) super.clone(); 
+        } catch (CloneNotSupportedException e) { 
+            e.printStackTrace(); 
+        } 
+        return student; 
+    } 
+
+}
+public class Test {  
+
+    public static void main(String args[]) {
+        Teacher teacher = new Teacher (); //定义老师1
+        teacher.setName("刘老师");
+        Student stu1 = new Student();  //定义学生1
+        stu1.setName("test1");           
+        stu1.setTeacher(teacher);
+
+        Student stu2 = stu1.clone(); //定义学生2
+        stu2.setName("test2");  
+        stu2.getTeacher().setName("王老师");//修改老师
+        System.out.println("学生" + stu1.getName + "的老师是:" + stu1.getTeacher().getName);  
+        System.out.println("学生" + stu1.getName + "的老师是:" + stu2.getTeacher().getName);  
+    }  
+}
+```
+
+> 适用场景
+
+在一些重复创建对象的场景下，我们就可以使用原型模式来提高对象的创建性能。例如，我在开头提到的，循环体内创建对象时，我们就可以考虑用 clone 的方式来实现。
+
+```java
+
+for(int i=0; i<list.size(); i++){
+    Student stu = new Student(); 
+    ...
+}
+
+// 原型模式优化
+Student stu = new Student(); 
+for(int i=0; i<list.size(); i++){
+    Student stu1 = (Student)stu.clone();
+    ...
+}
+```
+
+除此之外，原型模式在开源框架中的应用也非常广泛。例如 Spring 中，@Service 默认都是单例的。用了私有全局变量，若不想影响下次注入或每次上下文获取 bean，就需要用到原型模式，我们可以通过以下注解来实现，@Scope(“prototype”)。
+
+### 享元模式
+
+享元模式是运用共享技术有效地最大限度地复用细粒度对象的一种模式。该模式中，以对象的信息状态划分，可以分为内部数据和外部数据。内部数据是对象可以共享出来的信息，这些信息不会随着系统的运行而改变；外部数据则是在不同运行时被标记了不同的值。
+
+享元模式一般可以分为三个角色，分别为 Flyweight（抽象享元类）、ConcreteFlyweight（具体享元类）和 FlyweightFactory（享元工厂类）。抽象享元类通常是一个接口或抽象类，向外界提供享元对象的内部数据或外部数据；具体享元类是指具体实现内部数据共享的类；享元工厂类则是主要用于创建和管理享元对象的工厂类。
+
+```java
+
+//抽象享元类
+interface Flyweight {
+    //对外状态对象
+    void operation(String name);
+    //对内对象
+    String getType();
+}
+
+//具体享元类
+class ConcreteFlyweight implements Flyweight {
+    private String type;
+
+    public ConcreteFlyweight(String type) {
+        this.type = type;
+    }
+
+    @Override
+    public void operation(String name) {
+        System.out.printf("[类型(内在状态)] - [%s] - [名字(外在状态)] - [%s]\n", type, name);
+    }
+
+    @Override
+    public String getType() {
+        return type;
+    }
+}
+
+//享元工厂类
+class FlyweightFactory {
+    //享元池，用来存储享元对象
+    private static final Map<String, Flyweight> FLYWEIGHT_MAP = new HashMap<>();
+
+    public static Flyweight getFlyweight(String type) {
+        //如果在享元池中存在对象，则直接获取
+        if (FLYWEIGHT_MAP.containsKey(type)) {
+            return FLYWEIGHT_MAP.get(type);
+        } else {
+            //在享元池不存在，则新创建对象，并放入到享元池
+            ConcreteFlyweight flyweight = new ConcreteFlyweight(type);
+            FLYWEIGHT_MAP.put(type, flyweight);
+            return flyweight;
+        }
+    }
+}
+
+public class Client {
+
+    public static void main(String[] args) {
+        Flyweight fw0 = FlyweightFactory.getFlyweight("a");
+        Flyweight fw1 = FlyweightFactory.getFlyweight("b");
+        Flyweight fw2 = FlyweightFactory.getFlyweight("a");
+        Flyweight fw3 = FlyweightFactory.getFlyweight("b");
+        fw1.operation("abc");
+        System.out.printf("[结果(对象对比)] - [%s]\n", fw0 == fw2);
+        System.out.printf("[结果(内在状态)] - [%s]\n", fw1.getType());
+    }
+}
+/**
+[类型(内在状态)] - [b] - [名字(外在状态)] - [abc]
+[结果(对象对比)] - [true]
+[结果(内在状态)] - [b]
+*/
+```
+
+> 适用场景
+
+享元模式在实际开发中的应用也非常广泛。例如 Java 的 String 字符串，在一些字符串常量中，会共享常量池中字符串对象，从而减少重复创建相同值对象，占用内存空间。
+
+### 总结
+
+在不得已需要重复创建大量同一对象时，我们可以使用原型模式，通过 clone 方法复制对象，这种方式比用 new 和序列化创建对象的效率要高；在创建对象时，如果我们可以共用对象的内部数据，那么通过享元模式共享相同的内部数据的对象，就可以减少对象的创建，实现系统调优。
+
+```markdown
+# new一个对象和clone一个对象，性能差在哪里呢？
+- 一个对象通过new创建的过程为：
+- - 1、在内存中开辟一块空间；
+- - 2、在开辟的内存空间中创建对象；
+- - 3、调用对象的构造函数进行初始化对象。
+- 而一个对象通过clone创建的过程为：
+- - 1、根据原对象内存大小开辟一块内存空间；
+- - 2、复制已有对象，克隆对象中所有属性值。
+- 相对new来说，clone少了调用构造函数。如果构造函数中存在大量属性初始化或大对象，则使用clone的复制对象的方式性能会好一些。
+# 单例模式和享元模式的区别？
+- 单例模式是针对某个类的单例，享元模式可以针对一个类的不同表现形式的单例，享元模式是单例模式的超集。
+- 享元模式可以再次创建对象，也可以取缓存对象，单例模式则是严格控制单个进程中只有一个实例对象。
+```
+
+## 如何使用设计模式优化并发编程？
+
+### 线程上下文设计模式
+
+线程上下文是指贯穿线程整个生命周期的对象中的一些全局信息。例如，我们比较熟悉的 Spring 中的 ApplicationContext 就是一个关于上下文的类，它在整个系统的生命周期中保存了配置信息、用户信息以及注册的 bean 等上下文信息。
+
+```java
+
+public class ContextTest {
+
+    // 上下文类
+    @Data
+    public class Context {
+        private String name;
+        private long id;
+    }
+
+    // 设置上下文名字
+    public class QueryNameAction {
+        public void execute(Context context) {
+            try {
+                Thread.sleep(1000L);
+                String name = Thread.currentThread().getName();
+                context.setName(name);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // 设置上下文ID
+    public class QueryIdAction {
+        public void execute(Context context) {
+            try {
+                Thread.sleep(1000L);
+                long id = Thread.currentThread().getId();
+                context.setId(id);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // 执行方法
+    public class ExecutionTask implements Runnable {
+
+        private QueryNameAction queryNameAction = new QueryNameAction();
+        private QueryIdAction queryIdAction = new QueryIdAction();
+
+        @Override
+        public void run() {
+            final Context context = new Context();
+            queryNameAction.execute(context);
+            System.out.println("The name query successful");
+            queryIdAction.execute(context);
+            System.out.println("The id query successful");
+
+            System.out.println("The Name is " + context.getName() + " and id " + context.getId());
+        }
+    }
+
+    public static void main(String[] args) {
+        IntStream.range(1, 5).forEach(i -> new Thread(new ContextTest().new ExecutionTask()).start());
+    }
+}
+```
+
+除了以上这些方法，其实我们还可以使用 ThreadLocal 实现上下文。ThreadLocal 是线程本地变量，可以实现多线程的数据隔离。ThreadLocal 为每一个使用该变量的线程都提供一份独立的副本，线程间的数据是隔离的，每一个线程只能访问各自内部的副本变量。
+
+```java
+public class ContextTest {
+    // 上下文类
+    @Data
+    public static class Context {
+        private String name;
+        private long id;
+    }
+
+    // 复制上下文到ThreadLocal中
+    public final static class ActionContext {
+
+        private static final ThreadLocal<Context> threadLocal = new ThreadLocal<Context>() {
+            @Override
+            protected Context initialValue() {
+                return new Context();
+            }
+        };
+
+        public static ActionContext getActionContext() {
+            return ContextHolder.actionContext;
+        }
+
+        public Context getContext() {
+            return threadLocal.get();
+        }
+
+        // 获取ActionContext单例
+        public static class ContextHolder {
+            private final static ActionContext actionContext = new ActionContext();
+        }
+    }
+
+    // 设置上下文名字
+    public class QueryNameAction {
+        public void execute() {
+            try {
+                Thread.sleep(1000L);
+                String name = Thread.currentThread().getName();
+                ActionContext.getActionContext().getContext().setName(name);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // 设置上下文ID
+    public class QueryIdAction {
+        public void execute() {
+            try {
+                Thread.sleep(1000L);
+                long id = Thread.currentThread().getId();
+                ActionContext.getActionContext().getContext().setId(id);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    // 执行方法
+    public class ExecutionTask implements Runnable {
+        private QueryNameAction queryNameAction = new QueryNameAction();
+        private QueryIdAction queryIdAction = new QueryIdAction();
+
+        @Override
+        public void run() {
+            queryNameAction.execute();//设置线程名
+            System.out.println("The name query successful");
+            queryIdAction.execute();//设置线程ID
+            System.out.println("The id query successful");
+
+            System.out.println("The Name is " + ActionContext.getActionContext().getContext().getName() + " and id " + ActionContext.getActionContext().getContext().getId());
+        }
+    }
+
+    public static void main(String[] args) {
+        IntStream.range(1, 5).forEach(i -> new Thread(new ContextTest().new ExecutionTask()).start());
+    }
+}
+```
+
+### Thread-Per-Message 设计模式
+
+Thread-Per-Message 设计模式翻译过来的意思就是每个消息一个线程的意思。例如，我们在处理 Socket 通信的时候，通常是一个线程处理事件监听以及 I/O 读写，如果 I/O 读写操作非常耗时，这个时候便会影响到事件监听处理事件。
+
+这个时候 Thread-Per-Message 模式就可以很好地解决这个问题，一个线程监听 I/O 事件，每当监听到一个 I/O 事件，则交给另一个处理线程执行 I/O 操作。
+
+我们可以使用线程池来代替线程的创建和销毁，这样就可以避免创建大量线程而带来的性能问题，是一种很好的调优方法。
+
+### Worker-Thread 设计模式
+
+这里的 Worker 是工人的意思，代表在 Worker Thread 设计模式中，会有一些工人（线程）不断轮流处理过来的工作，当没有工作时，工人则会处于等待状态，直到有新的工作进来。除了工人角色，Worker Thread 设计模式中还包括了流水线和产品。
+
+这种设计模式相比 Thread-Per-Message 设计模式，可以减少频繁创建、销毁线程所带来的性能开销，还有无限制地创建线程所带来的内存溢出风险。
+
+## 生产者消费者模式：电商库存设计优化
+
+### Condition 实现生产者消费者
+
+### BlockingQueue 实现生产者消费者
+
+BockingQueue 是线程安全的，且从队列中获取或者移除元素时，如果队列为空，获取或移除操作则需要等待，直到队列不为空；同时，如果向队列中添加元素，假设此时队列无可用空间，添加操作也需要等待。所以 BlockingQueue 非常适合用来实现生产者消费者模式。
+
+##  装饰器模式：如何优化电商系统中复杂的商品价格策略？
+
+装饰器模式能够实现为对象动态添加装修功能，它是从一个对象的外部来给对象添加功能，所以有非常灵活的扩展性，我们可以在对原来的代码毫无修改的前提下，为对象添加新功能。除此之外，装饰器模式还能够实现对象的动态组合，借此我们可以很灵活地给动态组合的对象，匹配所需要的功能。
+
+### 什么是装饰器模式？
+
+装饰器模式包括了以下几个角色：接口、具体对象、装饰类、具体装饰类。
+
+接口定义了具体对象的一些实现方法；具体对象定义了一些初始化操作；装饰类则是一个抽象类，主要用来初始化具体对象的一个类；其它的具体装饰类都继承了该抽象类。
+
+```java
+
+/**
+ * 定义一个基本装修接口
+ * @author admin
+ *
+ */
+public interface IDecorator {
+
+    /**
+   * 装修方法
+   */
+    void decorate();
+
+}
+
+/**
+ * 装修基本类
+ * @author admin
+ *
+ */
+public class Decorator implements IDecorator{
+
+    /**
+   * 基本实现方法
+   */
+    public void decorate() {
+        System.out.println("水电装修、天花板以及粉刷墙。。。");
+    }
+
+}
+
+/**
+ * 基本装饰类
+ * @author admin
+ *
+ */
+public abstract class BaseDecorator implements IDecorator{
+
+    private IDecorator decorator;
+
+    public BaseDecorator(IDecorator decorator) {
+        this.decorator = decorator;
+    }
+
+    /**
+   * 调用装饰方法
+   */
+    public void decorate() {
+        if(decorator != null) {
+            decorator.decorate();
+        }
+    }
+}
+
+/**
+ * 窗帘装饰类
+ * @author admin
+ *
+ */
+public class CurtainDecorator extends BaseDecorator{
+
+    public CurtainDecorator(IDecorator decorator) {
+        // 调用父类的构造函数,用传入的对象实例化父类的属性
+        super(decorator);
+    }
+
+    /**
+   * 窗帘具体装饰方法
+   */
+    @Override
+    public void decorate() {
+        System.out.println("窗帘装饰。。。");
+        // 调用父类的函数
+        super.decorate();
+    }
+
+}
+
+public static void main( String[] args )
+{
+    IDecorator decorator = new Decorator();
+    IDecorator curtainDecorator = new CurtainDecorator(decorator);
+    curtainDecorator.decorate();
+}
+/*
+窗帘装饰。。。
+水电装修、天花板以及粉刷墙。。。
+*/
+```
+
+通过这个案例，我们可以了解到：如果我们想要在基础类上添加新的装修功能，只需要基于抽象类 BaseDecorator 去实现继承类，**通过构造函数调用父类**，以及重写装修方法实现装修窗帘的功能即可。在 main 函数中，我们通过实例化装饰类，调用装修方法，即可在基础装修的前提下，获得窗帘装修功能。
+
+通常，装饰器模式用于扩展一个类的功能，且支持动态添加和删除类的功能。在装饰器模式中，装饰类和被装饰类都只关心自身的业务，不相互干扰，真正实现了解耦。
