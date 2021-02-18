@@ -108,6 +108,11 @@ redo log 是 InnoDB 引擎特有的日志，而 Server 层也有自己的日志�
 
 这是为了让两份日志之间的逻辑一致。
 
+```markdown
+- redo log 用于保证 crash-safe 能力。innodb_flush_log_at_trx_commit 这个参数设置成 1 的时候，表示每次事务的 redo log 都直接持久化到磁盘。这个参数我建议你设置成 1，这样可以保证 MySQL 异常重启之后数据不丢失。
+- redo log 用于保证 crash-safe 能力。innodb_flush_log_at_trx_commit 这个参数设置成 1 的时候，表示每次事务的 redo log 都直接持久化到磁盘。这个参数我建议你设置成 1，这样可以保证 MySQL 异常重启之后数据不丢失。
+```
+
 ## 事务隔离
 
 事务就是要保证一组数据库操作，要么全部成功，要么全部失败。
@@ -835,4 +840,451 @@ MySQL 中的一个机制，可能让你的查询会更慢：刷脏页时连坐�
 在 MySQL 8.0 中，innodb_flush_neighbors 参数的默认值已经是 0 了。
 
 ## 为什么表数据删掉一半，表文件大小不变？
+
+一个 InnoDB 表包含两部分，即：表结构定义和数据。在 MySQL 8.0 版本以前，表结构是存在以.frm 为后缀的文件里。而 MySQL 8.0 版本，则已经允许把表结构定义放在系统数据表中了。因为表结构定义占用的空间很小。
+
+### 参数 innodb_file_per_table
+
+表数据既可以存在共享表空间里，也可以是单独的文件。这个行为是由参数 `innodb_file_per_table` 控制的：
+
+* 这个参数设置为 OFF 表示的是，表的数据放在系统共享表空间，也就是跟数据字典放在一起；
+* 这个参数设置为 ON 表示的是，每个 InnoDB 表数据存储在一个以 .ibd 为后缀的文件中。
+
+> 我建议你不论使用 MySQL 的哪个版本，都将这个值设置为 ON。因为，一个表单独存储为一个文件更容易管理，而且在你不需要这个表的时候，通过 drop table 命令，系统就会直接删除这个文件。而如果是放在共享表空间中，即使表删掉了，空间也是不会回收的。
+
+### 数据删除流程
+
+InnoDB 里的数据都是用 B+ 树的结构组织的。
+
+![image-20210218114622375](MySQL.assets/image-20210218114622375.png)
+
+假设，我们要删掉 R4 这个记录，**InnoDB 引擎只会把 R4 这个记录标记为删除**。如果之后要再插入一个 ID 在 300 和 600 之间的记录时，**可能会复用这个位置**。但是，磁盘文件的大小并不会缩小。
+
+如果我们删掉了一个数据页上的所有记录，整个数据页就可以被复用了。
+
+如果我们用 delete 命令把整个表的数据删除呢？结果就是，所有的数据页都会被标记为可复用。但是磁盘上，文件不会变小。
+
+**delete 命令其实只是把记录的位置，或者数据页标记为了“可复用”，但磁盘文件的大小是不会变的**。也就是说，通过 delete 命令是不能回收表空间的。这些可以复用，而没有被使用的空间，看起来就像是“空洞”。
+
+```markdown
+# 不止是删除数据会造成空洞，插入数据也会。
+- 如果数据是按照索引递增顺序插入的，那么索引是紧凑的。但如果数据是随机插入的，就可能造成索引的数据页分裂。
+
+- 更新索引上的值，可以理解为删除一个旧的值，再插入一个新值。不难理解，这也是会造成空洞的。
+- 经过大量增删改的表，都是可能是存在空洞的。所以，如果能够把这些空洞去掉，就能达到收缩表空间的目的。
+```
+
+### 重建表
+
+使用 `alter table A engine=InnoDB` 命令来重建表。
+
+```markdown
+# MySQL5.5 版本之前重建表的流程
+- 重建表A，就新建立一个表B，然后按照主键 ID 递增的顺序，把数据一行一行地从表 A 里读出来再插入到表 B 中。
+- 由于表 B 是新建的表，所以表 A 主键索引上的空洞，在表 B 中就都不存在了。显然地，表 B 的主键索引更紧凑，数据页的利用率也更高。如果我们把表 B 作为临时表，数据从表 A 导入表 B 的操作完成后，用表 B 替换 A，从效果上看，就起到了收缩表 A 空间的作用。
+- 执行这个 alter table A engine=InnoDB 命令，MySQL 会自动完成转存数据、交换表名、删除旧表的操作。
+- 花时间最多的步骤是往临时表插入数据的过程，如果在这个过程中，有新的数据要写入到表 A 的话，就会造成数据丢失。因此，在整个 DDL 过程中，表 A 中不能有更新。也就是说，这个 DDL 不是 Online 的。
+```
+
+![image-20210218124154648](MySQL.assets/image-20210218124154648.png)
+
+```markdown
+# MySQL 5.6 版本开始引入的 Online DDL，对这个操作流程做了优化
+## 引入了 Online DDL 之后，重建表的流程：
+- 1.建立一个临时文件，扫描表 A 主键的所有数据页；
+- 2.用数据页中表 A 的记录生成 B+ 树，存储到临时文件中；
+- 3.生成临时文件的过程中，将所有对 A 的操作记录在一个日志文件（row log）中，对应的是图中 state2 的状态；
+- 4.临时文件生成后，将日志文件中的操作应用到临时文件，得到一个逻辑数据上与表 A 相同的数据文件，对应的就是图中 state3 的状态；
+- 用临时文件替换表 A 的数据文件。
+```
+
+![image-20210218122458071](MySQL.assets/image-20210218122458071.png)
+
+> 由于日志文件记录和重放操作这个功能的存在，这个方案在重建表的过程中，允许对表 A 做增删改操作。这也就是 Online DDL 名字的来源。
+>
+> Online DDL 其实是会先获取MDL写锁, 再退化成MDL读锁；但MDL写锁持有时间比较短，所以可以称为Online； 而MDL读锁，不阻止数据增删查改，但会阻止其它线程修改表结构；
+>
+> 在重建表的时候，InnoDB 不会把整张表占满，每个页留了 1/16 给后续的更新用。也就是说，其实重建表之后不是“最”紧凑的。
+
+[GitHub 一个开源的缩小表空间工具](https://github.com/github/gh-ost)
+
+### Online 和 inplace
+
+Online的含义就是在操作时不会阻塞对原表的增删改功能。
+
+第一幅拷贝数据图中，我们把表 A 中的数据导出来的存放位置叫作 tmp_table。这是一个临时表，是在 server 层创建的。
+
+第二幅图中，根据表 A 重建出来的数据是放在“tmp_file”里的，**这个临时文件是 InnoDB 在内部创建出来的**。整个 DDL 过程都在 InnoDB 内部完成。对于 server 层来说，没有把数据挪动到临时表，是一个“原地”操作，这就是“inplace”名称的来源。
+
+```mysql
+-- 重建表的这个语句 alter table t engine=InnoDB，其实隐含的意思是：
+alter table t engine=innodb,ALGORITHM=inplace;
+-- 跟 inplace 对应的就是拷贝表的方式了，用法是：
+alter table t engine=innodb,ALGORITHM=copy;
+```
+
+```mysql
+-- 给 InnoDB 表的一个字段加全文索引
+alter table t add FULLTEXT(field_name);
+-- 这个过程是 inplace 的，但会阻塞增删改操作，是非 Online 的。
+```
+
+```markdown
+# "Online" 是 "inplace" 的子集。
+- DDL 过程如果是 Online 的，就一定是 inplace 的；
+- 反过来未必，也就是说 inplace 的 DDL，有可能不是 Online 的。截止到 MySQL 8.0，添加全文索引（FULLTEXT index）和空间索引 (SPATIAL index) 就属于这种情况。
+```
+
+```markdown
+# 使用 optimize table、analyze table 和 alter table 这三种方式重建表的区别
+- 从 MySQL 5.6 版本开始，alter table t engine = InnoDB（也就是 recreate）默认的就是上面图的流程了；
+- analyze table t 其实不是重建表，只是对表的索引信息做重新统计，没有修改数据，这个过程中加了 MDL 读锁；
+- optimize table t 等于 recreate+analyze。
+```
+
+## count(*)这么慢，我该怎么办？
+
+### count(*) 的实现方式
+
+在不同的 MySQL 引擎中，count(*) 有不同的实现方式。
+
+* MyISAM 引擎把一个表的总行数存在了磁盘上，因此执行 count(*) 的时候会直接返回这个数，效率很高；
+* 而 InnoDB 引擎就麻烦了，它执行 count(*) 的时候，需要把数据一行一行地从引擎里面读出来，然后累积计数。
+
+> 不论是在事务支持、并发能力还是在数据安全方面，InnoDB 都优于 MyISAM。
+
+```markdown
+# 为什么 InnoDB 不跟 MyISAM 一样，也把数字存起来呢？
+- 这是因为即使是在同一个时刻的多个查询，由于多版本并发控制（MVCC）的原因，InnoDB 表“应该返回多少行”也是不确定的。
+- 这和 InnoDB 的事务设计有关系，可重复读是它默认的隔离级别，在代码上就是通过多版本并发控制，也就是 MVCC 来实现的。每一行记录都要判断自己是否对这个会话可见，因此对于`count(*)` 请求来说，InnoDB 只好把数据一行一行地读出依次判断，可见的行才能够用于计算“基于这个查询”的表的总行数。
+# MySQL 对`count(*)`的优化
+- InnoDB 是索引组织表，主键索引树的叶子节点是数据，而普通索引树的叶子节点是主键值。所以，普通索引树比主键索引树小很多。对于 `count(*)` 这样的操作，遍历哪个索引树得到的结果逻辑上都是一样的。因此，MySQL 优化器会找到最小的那棵树来遍历。在保证逻辑正确的前提下，尽量减少扫描的数据量，是数据库系统设计的通用法则之一。
+```
+
+```markdown
+# 总结：
+- 1.MyISAM 表虽然 `count(*)` 很快，但是不支持事务；
+- 2.show table status 命令虽然返回很快，但是不准确；
+- 3.InnoDB 表直接 `count(*)` 会遍历全表，虽然结果准确，但会导致性能问题。
+```
+
+### 用缓存系统保存计数
+
+用一个 Redis 服务来保存这个表的总行数。
+
+```markdown
+# 缓存系统可能会丢失更新。
+- Redis 异常重启以后，到数据库里面单独执行一次 `count(*)` 获取真实的行数，再把这个值写回到 Redis 里就可以了。异常重启毕竟不是经常出现的情况，这一次全表扫描的成本，还是可以接受的。
+# 将计数保存在缓存系统中的方式，还不只是丢失更新的问题。即使 Redis 正常工作，这个值还是逻辑上不精确的。
+- 这里主要原因是因为“MySQL插入一行数据”跟“Redis计数加1”这两个操作是分开的，不是原子性的，这就很可能在中间过程因为某些并发出现问题。 更抽象一点：MySQL和Redis是两个不同的载体，将关联数据记录到不同的载体，而不同载体要实现原子性很难，由于不是原子性很容易引起并发问题。如果能将数据统一在同个载体即MySQL，并由其保证操作的原子性，即将插入一行数据和计数加1作为一个完整的事务，通过事务的隔离此时外界看到的就是要么全部执行完毕要么全部都没执行，进而保持逻辑一致。
+```
+
+### 在数据库保存计数
+
+如果我们把这个计数直接放到数据库里单独的一张计数表 C 中，又会怎么样呢？
+
+首先，这解决了崩溃丢失的问题，InnoDB 是支持崩溃恢复不丢数据的。
+
+利用事务的特性， 将计数的记录 + 1和插入一条数据放入到同一个事务中，可解决计数不精确的问题。
+
+### 不同的 count 用法
+
+在 select count(?) from t 这样的查询语句里面，count(*)、count(主键 id)、count(字段) 和 count(1) 等不同用法的性能，有哪些差别
+
+count() 是一个聚合函数，对于返回的结果集，一行行地判断，如果 count 函数的参数不是 NULL，累计值就加 1，否则不加。最后返回累计值。
+
+所以，count(*)、count(主键 id) 和 count(1) 都表示返回满足条件的结果集的总行数；而 count(字段），则表示返回满足条件的数据行里面，参数“字段”不为 NULL 的总个数。
+
+```markdown
+- 对于 count(主键 id) 来说，InnoDB 引擎会遍历整张表，把每一行的 id 值都取出来，返回给 server 层。server 层拿到 id 后，判断是不可能为空的，就按行累加。
+- 对于 count(1) 来说，InnoDB 引擎遍历整张表，但不取值。server 层对于返回的每一行，放一个数字“1”进去，判断是不可能为空的，按行累加。
+- 对于 count(字段) 来说：
+- - 如果这个“字段”是定义为 not null 的话，一行行地从记录里面读出这个字段，判断不能为 null，按行累加；
+- - 如果这个“字段”定义允许为 null，那么执行的时候，判断到有可能是 null，还要把值取出来再判断一下，不是 null 才累加。
+- 但是 `count(*)` 是例外，并不会把全部字段取出来，而是专门做了优化，不取值。`count(*)` 肯定不是 null，按行累加。
+```
+
+所以结论是：按照效率排序的话，count(字段)<count(主键ID)<count(1)=count(*)
+
+尽量使用 count(*)。
+
+## “order by”是怎么工作的？
+
+```mysql
+-- 假设你要查询城市是“杭州”的所有人名字，并且按照姓名排序返回前 1000 个人的姓名、年龄。
+CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `city` varchar(16) NOT NULL,
+  `name` varchar(16) NOT NULL,
+  `age` int(11) NOT NULL,
+  `addr` varchar(128) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `city` (`city`)
+) ENGINE=InnoDB;
+-- 主键id，普通索引city
+select city,name,age from t where city='杭州' order by name limit 1000  ;
+```
+
+### 全字段排序
+
+> 在 city 字段上创建索引之后，我们用 explain 命令来看看这个语句的执行情况。
+
+![image-20210218145524811](MySQL.assets/image-20210218145524811.png)
+
+> Extra 这个字段中的“Using filesort”表示的就是需要排序，MySQL 会给每个线程分配一块内存用于排序，称为 sort_buffer。
+
+![image-20210218145729710](MySQL.assets/image-20210218145729710.png)
+
+```markdown
+# 全字段排序执行流程
+- 1.初始化 sort_buffer，确定放入 name、city、age 这三个字段；
+- 2.从索引 city 找到第一个满足 city='杭州’条件的主键 id，也就是图中的 ID_X；
+- 3.到主键 id 索引取出整行，取 name、city、age 三个字段的值，存入 sort_buffer 中；
+- 4.从索引 city 取下一个记录的主键 id；
+- 5.重复步骤 3、4 直到 city 的值不满足查询条件为止，对应的主键 id 也就是图中的 ID_Y；
+- 6.对 sort_buffer 中的数据按照字段 name 做快速排序；
+- 7.按照排序结果取前 1000 行返回给客户端。
+```
+
+> “按 name 排序”这个动作，可能在内存中完成，也可能需要使用外部排序，这取决于排序所需的内存和参数 sort_buffer_size。
+>
+> sort_buffer_size，就是 MySQL 为排序开辟的内存（sort_buffer）的大小。如果要排序的数据量小于 sort_buffer_size，排序就在内存中完成。但如果排序数据量太大，内存放不下，则不得不利用磁盘临时文件辅助排序。
+
+```mysql
+-- 用下面介绍的方法，来确定一个排序语句是否使用了临时文件。
+/* 打开optimizer_trace，只对本线程有效 */
+SET optimizer_trace='enabled=on'; 
+/* @a保存Innodb_rows_read的初始值 */
+select VARIABLE_VALUE into @a from  performance_schema.session_status where variable_name = 'Innodb_rows_read';
+/* 执行语句 */
+select city, name,age from t where city='杭州' order by name limit 1000; 
+/* 查看 OPTIMIZER_TRACE 输出 */
+SELECT * FROM `information_schema`.`OPTIMIZER_TRACE`\G
+/* @b保存Innodb_rows_read的当前值 */
+select VARIABLE_VALUE into @b from performance_schema.session_status where variable_name = 'Innodb_rows_read';
+/* 计算Innodb_rows_read差值 */
+select @b-@a;
+-- 这个方法是通过查看 OPTIMIZER_TRACE 的结果来确认的，你可以从 number_of_tmp_files 中看到是否使用了临时文件。
+```
+
+![image-20210218150314117](MySQL.assets/image-20210218150314117.png)
+
+```markdown
+- number_of_tmp_files=12:内存放不下时，就需要使用外部排序，外部排序一般使用归并排序算法。可以这么简单理解，MySQL 将需要排序的数据分成 12 份，每一份单独排序后存在这些临时文件中。然后把这 12 个有序文件再合并成一个有序的大文件。sort_buffer_size 越小，需要分成的份数越多，number_of_tmp_files 的值就越大。
+- examined_rows=4000，表示参与排序的行数是 4000 行。
+- sort_mode 里面的 packed_additional_fields 的意思是，排序过程对字符串做了“紧凑”处理。即使 name 字段的定义是 varchar(16)，在排序过程中还是要按照实际长度来分配空间的。
+```
+
+![image-20210218151449823](MySQL.assets/image-20210218151449823.png)
+
+### rowid 排序
+
+全字段排序是如果查询要返回的字段很多的话，那么 sort_buffer 里面要放的字段数太多，这样内存里能够同时放下的行数很少，要分成很多个临时文件，排序的性能会很差。
+
+```mysql
+-- 修改一个参数，让 MySQL 采用另外一种算法。
+SET max_length_for_sort_data = 16;
+-- max_length_for_sort_data，是 MySQL 中专门控制用于排序的行数据的长度的一个参数。
+-- 它的意思是，如果单行的长度超过这个值，MySQL 就认为单行太大，要换一个算法。
+```
+
+新的算法放入 sort_buffer 的字段，只有要排序的列（即 name 字段）和主键 id。
+
+```markdown
+# 排序的结果就因为少了 city 和 age 字段的值，不能直接返回了，整个执行流程就变成如下所示的样子：
+- 1.初始化 sort_buffer，确定放入两个字段，即 name 和 id；
+- 2.从索引 city 找到第一个满足 city='杭州’条件的主键 id，也就是图中的 ID_X；
+- 3.到主键 id 索引取出整行，取 name、id 这两个字段，存入 sort_buffer 中；
+- 4.从索引 city 取下一个记录的主键 id；
+- 5.重复步骤 3、4 直到不满足 city='杭州’条件为止，也就是图中的 ID_Y；
+- 6.对 sort_buffer 中的数据按照字段 name 进行排序；
+- 7.遍历排序结果，取前 1000 行，并按照 id 的值回到原表中取出 city、name 和 age 三个字段返回给客户端。
+```
+
+![image-20210218151515812](MySQL.assets/image-20210218151515812.png)
+
+![image-20210218151635071](MySQL.assets/image-20210218151635071.png)
+
+```markdown
+- sort_mode 变成了 ，表示参与排序的只有 name 和 id 这两个字段。
+- number_of_tmp_files 变成 10 了，是因为这时候参与排序的行数虽然仍然是 4000 行，但是每一行都变小了，因此需要排序的总数据量就变小了，需要的临时文件也相应地变少了。
+- select @b-@a 这个语句的值变成 5000 了。因为这时候除了排序过程外，在排序完成后，还要根据 id 去原表取值。由于语句是 limit 1000，因此会多读 1000 行。
+```
+
+### 全字段排序 VS rowid 排序
+
+如果 MySQL 实在是担心排序内存太小，会影响排序效率，才会采用 rowid 排序算法，这样排序过程中一次可以排序更多行，但是需要再回到原表去取数据。
+
+如果 MySQL 认为内存足够大，会优先选择全字段排序，把需要的字段都放到 sort_buffer 中，这样排序后就会直接从内存里面返回查询结果了，不用再回到原表去取数据。
+
+这也就体现了 MySQL 的一个设计思想：**如果内存够，就要多利用内存，尽量减少磁盘访问。**
+
+```markdown
+# 什么情况下 order by 不需要排序
+- 如果需要排序的字段，上面有索引，因为索引是有序的，所以就不用排序了
+# 我们可以在这个市民表上创建一个 city 和 name 的联合索引
+- alter table t add index city_user(city, name);
+- 在这个索引里面，我们依然可以用树搜索的方式定位到第一个满足 city='杭州’的记录，并且额外确保了，接下来按顺序取“下一条记录”的遍历过程中，只要 city 的值是杭州，name 的值就一定是有序的。
+```
+
+![image-20210218152531484](MySQL.assets/image-20210218152531484.png)
+
+![image-20210218152602567](MySQL.assets/image-20210218152602567.png)
+
+> 从图中可以看到，Extra 字段中没有 Using filesort 了，也就是不需要排序了。而且由于 (city,name) 这个联合索引本身有序，所以这个查询也不用把 4000 行全都读一遍，只要找到满足条件的前 1000 条记录就可以退出了。也就是说，在我们这个例子里，只需要扫描 1000 次。
+
+```markdown
+# 覆盖索引优化
+- 覆盖索引是指，索引上的信息足够满足查询请求，不需要再回到主键索引上去取数据。
+- alter table t add index city_user_age(city, name, age);
+```
+
+![image-20210218152742834](MySQL.assets/image-20210218152742834.png)
+
+![image-20210218152802984](MySQL.assets/image-20210218152802984.png)
+
+> 可以看到，Extra 字段里面多了“Using index”，表示的就是使用了覆盖索引，性能上会快很多。
+>
+> 这里并不是说要为了每个查询能用上覆盖索引，就要把语句中涉及的字段都建上联合索引，毕竟索引还是有维护代价的。这是一个需要权衡的决定。
+
+## 如何正确地显示随机消息？
+
+```mysql
+-- 随机显示三个单词
+mysql> CREATE TABLE `words` (
+    `id` int(11) NOT NULL AUTO_INCREMENT,
+    `word` varchar(64) DEFAULT NULL,
+    PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=0;
+  while i<10000 do
+    insert into words(word) values(concat(char(97+(i div 1000)), char(97+(i % 1000 div 100)), char(97+(i % 100 div 10)), char(97+(i % 10))));
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+
+call idata();
+```
+
+### 内存临时表
+
+```mysql
+mysql> select word from words order by rand() limit 3;
+-- 随机排序取前 3 个。虽然这个 SQL 语句写法很简单，但执行流程却有点复杂的。
+```
+
+![image-20210218164551897](MySQL.assets/image-20210218164551897.png)
+
+> Extra 字段显示 Using temporary，表示的是需要使用临时表；Using filesort，表示的是需要执行排序操作。
+
+对于 InnoDB 表来说，执行全字段排序会减少磁盘访问，因此会被优先选择。
+
+**对于内存表，回表过程只是简单地根据数据行的位置，直接访问内存得到数据，根本不会导致多访问磁盘**。优化器没有了这一层顾虑，那么它会优先考虑的，就是用于排序的行越小越好了，所以，MySQL 这时就会选择 rowid 排序。
+
+```markdown
+# 语句执行流程
+- 1.创建一个临时表。这个临时表使用的是 memory 引擎，表里有两个字段，第一个字段是 double 类型，为了后面描述方便，记为字段 R，第二个字段是 varchar(64) 类型，记为字段 W。并且，这个表没有建索引。
+- 2.从 words 表中，按主键顺序取出所有的 word 值。对于每一个 word 值，调用 rand() 函数生成一个大于 0 小于 1 的随机小数，并把这个随机小数和 word 分别存入临时表的 R 和 W 字段中，到此，扫描行数是 10000。
+- 3.现在临时表有 10000 行数据了，接下来你要在这个没有索引的内存临时表上，按照字段 R 排序。
+- 4.初始化 sort_buffer。sort_buffer 中有两个字段，一个是 double 类型，另一个是整型。
+- 5.从内存临时表中一行一行地取出 R 值和位置信息，分别存入 sort_buffer 中的两个字段里。这个过程要对内存临时表做全表扫描，此时扫描行数增加 10000，变成了 20000。
+- 6.在 sort_buffer 中根据 R 的值进行排序。注意，这个过程没有涉及到表操作，所以不会增加扫描行数。
+- 7.排序完成后，取出前三个结果的位置信息，依次到内存临时表中取出 word 值，返回给客户端。这个过程中，访问了表的三行数据，总扫描行数变成了 20003。
+```
+
+![image-20210218165251445](MySQL.assets/image-20210218165251445.png)
+
+> 如果你创建的表没有主键，或者把一个表的主键删掉了，那么 InnoDB 会自己生成一个长度为 6 字节的 rowid 来作为主键。
+>
+> order by rand() 使用了内存临时表，内存临时表排序的时候使用了 rowid 排序方法。
+
+### 磁盘临时表
+
+`tmp_table_size` 这个配置限制了内存临时表的大小，默认值是 16M。如果临时表大小超过了 tmp_table_size，那么内存临时表就会转成磁盘临时表。
+
+磁盘临时表使用的引擎默认是 InnoDB，是由参数 `internal_tmp_disk_storage_engine` 控制的。
+
+```mysql
+set tmp_table_size=1024;
+set sort_buffer_size=32768;
+set max_length_for_sort_data=16;
+/* 打开 optimizer_trace，只对本线程有效 */
+SET optimizer_trace='enabled=on'; 
+
+/* 执行语句 */
+select word from words order by rand() limit 3;
+
+/* 查看 OPTIMIZER_TRACE 输出 */
+SELECT * FROM `information_schema`.`OPTIMIZER_TRACE`\G
+```
+
+![image-20210218165711142](MySQL.assets/image-20210218165711142.png)
+
+> 因为将 max_length_for_sort_data 设置成 16，小于 word 字段的长度定义，所以我们看到 sort_mode 里面显示的是 rowid 排序，这个是符合预期的，参与排序的是随机值 R 字段和 rowid 字段组成的行。
+>
+> R 字段存放的随机值就 8 个字节，rowid 是 6 个字节，数据总行数是 10000，这样算出来就有 140000 字节，超过了 sort_buffer_size 定义的 32768 字节了。但是，number_of_tmp_files 的值居然是 0，难道不需要用临时文件吗？
+>
+> 这个 SQL 语句的排序确实没有用到临时文件，采用是 MySQL 5.6 版本引入的一个新的排序算法，即：优先队列排序算法。优先队列排序算法使用堆排序。如果维护堆大于sort_buffer_size ，就会使用归并排序。
+
+### 随机排序方法
+
+**随机算法1**
+
+```markdown
+# 如果只随机选择 1 个 word 值，可以怎么做呢？思路上是这样的：
+- 1.取得这个表的主键 id 的最大值 M 和最小值 N;
+- 2.用随机函数生成一个最大值到最小值之间的数 `X = (M-N)*rand() + N`;
+- 3.取不小于 X 的第一个 ID 的行。
+```
+
+```mysql
+mysql> select max(id),min(id) into @M,@N from t ;
+set @X= floor((@M-@N+1)*rand() + @N);
+select * from t where id >= @X limit 1;
+```
+
+这个方法效率很高，因为取 max(id) 和 min(id) 都是不需要扫描索引的，而第三步的 select 也可以用索引快速定位，可以认为就只扫描了 3 行。但实际上，这个算法本身并不严格满足题目的随机要求，因为 ID 中间可能有空洞，因此选择不同行的概率不一样，不是真正的随机。
+
+**随机算法2**
+
+```markdown
+- 1.取得整个表的行数，并记为 C。
+- 2.取得 Y = floor(C * rand())。 floor 函数在这里的作用，就是取整数部分。
+- 3.再用 limit Y,1 取得一行。
+```
+
+```mysql
+mysql> select count(*) into @C from t;
+set @Y = floor(@C * rand());
+set @sql = concat("select * from t limit ", @Y, ",1");
+prepare stmt from @sql;
+execute stmt;
+DEALLOCATE prepare stmt;
+```
+
+MySQL 处理 limit Y,1 的做法就是按顺序一个一个地读出来，丢掉前 Y 个，然后把下一个记录作为返回结果，因此这一步需要扫描 Y+1 行。再加上，第一步扫描的 C 行，总共需要扫描 C+Y+1 行，执行代价比随机算法 1 的代价要高。当然，随机算法 2 跟直接 order by rand() 比起来，执行代价还是小很多的。
+
+```markdown
+# 按照随机算法 2 的思路，要随机取 3 个 word 值
+- 1.取得整个表的行数，记为 C；
+- 2.根据相同的随机方法得到 Y1、Y2、Y3；
+- 3.再执行三个 limit Y, 1 语句得到三行数据。
+```
+
+```mysql
+mysql> select count(*) into @C from t;
+set @Y1 = floor(@C * rand());
+set @Y2 = floor(@C * rand());
+set @Y3 = floor(@C * rand());
+-- 在应用代码里面取Y1、Y2、Y3值，拼出SQL后执行
+select * from t limit @Y1，1；
+select * from t limit @Y2，1；
+select * from t limit @Y3，1；
+```
 
