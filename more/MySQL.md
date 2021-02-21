@@ -1288,3 +1288,509 @@ select * from t limit @Y2，1；
 select * from t limit @Y3，1；
 ```
 
+## 为什么这些SQL语句逻辑相同，性能却差异巨大？
+
+在 MySQL 中，有很多看上去逻辑相同，但性能却差异巨大的 SQL 语句。对这些语句使用不当的话，就会不经意间导致整个数据库的压力变大。
+
+### 案例一：条件字段函数操作
+
+```mysql
+-- 交易记录表 tradelog 包含交易流水号（tradeid）、交易员 id（operator）、交易时间（t_modified）等字段
+mysql> CREATE TABLE `tradelog` (
+    `id` int(11) NOT NULL,
+    `tradeid` varchar(32) DEFAULT NULL,
+    `operator` int(11) DEFAULT NULL,
+    `t_modified` datetime DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `tradeid` (`tradeid`),
+    KEY `t_modified` (`t_modified`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+-- 统计发生在所有年份中 7 月份的交易记录总数
+mysql> select count(*) from tradelog where month(t_modified)=7;
+-- t_modified 字段含有索引,但还是查询很慢
+```
+
+如果对字段做了函数计算，就用不上索引了，这是 MySQL 的规定。
+
+```markdown
+# 为什么条件是 where t_modified='2018-7-1’的时候可以用上索引，而改成 where month(t_modified)=7 的时候就不行了？
+- 实际上，B+ 树提供的这个快速定位能力，来源于同一层兄弟节点的有序性。
+- 但是，如果计算 month() 函数的话，你会看到传入 7 的时候，在树的第一层就不知道该怎么办了。
+```
+
+**对索引字段做函数操作，可能会破坏索引值的有序性，因此优化器就决定放弃走树搜索功能。**
+
+在这个例子里，放弃了树搜索功能，优化器可以选择遍历主键索引，也可以选择遍历索引 t_modified，优化器对比索引大小后发现，索引 t_modified 更小，遍历这个索引比遍历主键索引来得更快。因此最终还是会选择索引 t_modified。
+
+![image-20210221155558769](MySQL.assets/image-20210221155558769.png)
+
+> key="t_modified"表示的是，使用了 t_modified 这个索引；我在测试表数据中插入了 10 万行数据，rows=100335，说明这条语句扫描了整个索引的所有值；Extra 字段的 Using index，表示的是使用了覆盖索引。
+
+**由于在 t_modified 字段加了 month() 函数操作，导致了全索引扫描。**
+
+```mysql
+-- 手动更改使用索引
+mysql> select count(*) from tradelog where
+    -> (t_modified >= '2016-7-1' and t_modified<'2016-8-1') or
+    -> (t_modified >= '2017-7-1' and t_modified<'2017-8-1') or 
+    -> (t_modified >= '2018-7-1' and t_modified<'2018-8-1');
+```
+
+```markdown
+# 因为条件字段的函数操作破坏了索引的有序性，导致了全索引扫描
+- 不过优化器在个问题上确实有“偷懒”行为，即使是对于不改变有序性的函数，也不会考虑使用索引。比如，对于 select * from tradelog where id + 1 = 10000 这个 SQL 语句，这个加 1 操作并不会改变有序性，但是 MySQL 优化器还是不能用 id 索引快速定位到 9999 这一行。所以，需要你在写 SQL 语句的时候，手动改写成 where id = 10000 -1 才可以。
+```
+
+### 案例二：隐式类型转换
+
+```mysql
+mysql> select * from tradelog where tradeid=110717;
+-- 交易编号 tradeid 这个字段上，本来就有索引，但是 explain 的结果却显示，这条语句需要走全表扫描。你可能也发现了，tradeid 的字段类型是 varchar(32)，而输入的参数却是整型，所以需要做类型转换。
+```
+
+```markdown
+# 数据类型转换的规则是什么？
+- 在 MySQL 中，字符串和数字做比较的话，是将字符串转换成数字。
+```
+
+```mysql
+mysql> select * from tradelog where tradeid=110717;
+-- 对于优化器来说，这个语句相当于：
+mysql> select * from tradelog where  CAST(tradid AS signed int) = 110717;
+-- 这条语句触发了我们上面说到的规则：对索引字段做函数操作，优化器会放弃走树搜索功能。
+```
+
+### 案例三：隐式字符编码转换
+
+```mysql
+-- 假设系统里还有另外一个表 trade_detail，用于记录交易的操作细节。为了便于量化分析和复现，我往交易日志表 tradelog 和交易详情表 trade_detail 这两个表里插入一些数据。
+mysql> CREATE TABLE `trade_detail` (
+  `id` int(11) NOT NULL,
+  `tradeid` varchar(32) DEFAULT NULL,
+  `trade_step` int(11) DEFAULT NULL, /*操作步骤*/
+  `step_info` varchar(32) DEFAULT NULL, /*步骤信息*/
+  PRIMARY KEY (`id`),
+  KEY `tradeid` (`tradeid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8;
+
+insert into tradelog values(1, 'aaaaaaaa', 1000, now());
+insert into tradelog values(2, 'aaaaaaab', 1000, now());
+insert into tradelog values(3, 'aaaaaaac', 1000, now());
+
+insert into trade_detail values(1, 'aaaaaaaa', 1, 'add');
+insert into trade_detail values(2, 'aaaaaaaa', 2, 'update');
+insert into trade_detail values(3, 'aaaaaaaa', 3, 'commit');
+insert into trade_detail values(4, 'aaaaaaab', 1, 'add');
+insert into trade_detail values(5, 'aaaaaaab', 2, 'update');
+insert into trade_detail values(6, 'aaaaaaab', 3, 'update again');
+insert into trade_detail values(7, 'aaaaaaab', 4, 'commit');
+insert into trade_detail values(8, 'aaaaaaac', 1, 'add');
+insert into trade_detail values(9, 'aaaaaaac', 2, 'update');
+insert into trade_detail values(10, 'aaaaaaac', 3, 'update again');
+insert into trade_detail values(11, 'aaaaaaac', 4, 'commit');
+
+-- 如果要查询 id=2 的交易的所有操作步骤信息，SQL 语句可以这么写：
+mysql> select d.* from tradelog l, trade_detail d where d.tradeid=l.tradeid and l.id=2; /*语句Q1*/
+```
+
+![image-20210221160803067](MySQL.assets/image-20210221160803067.png)
+
+> 第一行显示优化器会先在交易记录表 tradelog 上查到 id=2 的行，这个步骤用上了主键索引，rows=1 表示只扫描一行；
+>
+> 第二行 key=NULL，表示没有用上交易详情表 trade_detail 上的 tradeid 索引，进行了全表扫描。
+
+在这个执行计划里，是从 tradelog 表中取 tradeid 字段，再去 trade_detail 表里查询匹配字段。因此，我们把 **tradelog 称为驱动表**，把 **trade_detail 称为被驱动表**，把 tradeid 称为关联字段。
+
+![image-20210221161134924](MySQL.assets/image-20210221161134924.png)
+
+> 第 1 步，是根据 id 在 tradelog 表里找到 L2 这一行；
+>
+> 第 2 步，是从 L2 中取出 tradeid 字段的值；
+>
+> 第 3 步，是根据 tradeid 值到 trade_detail 表中查找条件匹配的行。explain 的结果里面第二行的 key=NULL 表示的就是，这个过程是通过遍历主键索引的方式，一个一个地判断 tradeid 的值是否匹配。
+>
+> 因为这两个表的字符集不同，一个是 utf8，一个是 utf8mb4，所以做表连接查询的时候用不上关联字段的索引。
+
+```markdown
+# 为什么字符集不同就用不上索引呢？
+- 字符集 utf8mb4 是 utf8 的超集，所以当这两个类型的字符串在做比较的时候，MySQL 内部的操作是，先把 utf8 字符串转成 utf8mb4 字符集，再做比较。
+```
+
+```mysql
+-- 第三步的单独语句
+mysql> select * from trade_detail where tradeid=$L2.tradeid.value; 
+-- 在执行上面这个语句的时候，需要将被驱动数据表里的字段一个个地转换成 utf8mb4，再跟 L2 做比较。
+-- 等同于
+select * from trade_detail  where CONVERT(traideid USING utf8mb4)=$L2.tradeid.value; 
+-- 这就再次触发了我们上面说到的原则：对索引字段做函数操作，优化器会放弃走树搜索功能。
+```
+
+**字符集不同只是条件之一，连接过程中要求在被驱动表的索引字段上加函数操作，是直接导致对被驱动表做全表扫描的原因。**
+
+```mysql
+-- 查找 trade_detail 表里 id=4 的操作，对应的操作者是谁
+mysql>select l.operator from tradelog l , trade_detail d where d.tradeid=l.tradeid and d.id=4;
+```
+
+![image-20210221162237458](MySQL.assets/image-20210221162237458.png)
+
+> 这个语句里 trade_detail 表成了驱动表，但是 explain 结果的第二行显示，这次的查询操作用上了被驱动表 tradelog 里的索引 (tradeid)，扫描行数是 1。
+
+```mysql
+-- 类似的第三步操作
+select operator from tradelog  where traideid =$R4.tradeid.value; 
+-- 等同于
+select operator from tradelog  where traideid =CONVERT($R4.tradeid.value USING utf8mb4); 
+-- 这里的 CONVERT 函数是加在输入参数上的，这样就可以用上被驱动表的 traideid 索引。
+```
+
+```mysql
+-- 优化语句
+select d.* from tradelog l, trade_detail d where d.tradeid=l.tradeid and l.id=2;
+-- 比较常见的优化方法是，把 trade_detail 表上的 tradeid 字段的字符集也改成 utf8mb4，这样就没有字符集转换的问题了。
+alter table trade_detail modify tradeid varchar(32) CHARACTER SET utf8mb4 default null;
+-- 如果能够修改字段的字符集的话，是最好不过了。但如果数据量比较大， 或者业务上暂时不能做这个 DDL 的话，那就只能采用修改 SQL 语句的方法了。主动把 l.tradeid 转成 utf8，就避免了被驱动表上的字符编码转换
+select d.* from tradelog l , trade_detail d where d.tradeid=CONVERT(l.tradeid USING utf8) and l.id=2; 
+```
+
+## 为什么我只查一行的语句，也执行这么慢？
+
+```mysql
+mysql> CREATE TABLE `t` (
+  `id` int(11) NOT NULL,
+  `c` int(11) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB;
+
+delimiter ;;
+create procedure idata()
+begin
+  declare i int;
+  set i=1;
+  while(i<=100000) do
+    insert into t values(i,i);
+    set i=i+1;
+  end while;
+end;;
+delimiter ;
+
+call idata();
+```
+
+### 第一类：查询长时间不返回
+
+```mysql
+mysql> select * from t where id=1;
+-- 一般碰到这种情况的话，大概率是表 t 被锁住了。接下来分析原因的时候，一般都是首先执行一下 show processlist 命令，看看当前语句处于什么状态。
+```
+
+**等 MDL 锁**
+
+使用 show processlist 命令查看 Waiting for table metadata lock
+
+![image-20210221163454079](MySQL.assets/image-20210221163454079.png)
+
+**出现这个状态表示的是，现在有一个线程正在表 t 上请求或者持有 MDL 写锁，把 select 语句堵住了。**
+
+![image-20210221163724987](MySQL.assets/image-20210221163724987.png)
+
+> session A 通过 lock table 命令持有表 t 的 MDL 写锁，而 session B 的查询需要获取 MDL 读锁。所以，session B 进入等待状态。
+
+通过查询 sys.schema_table_lock_waits 这张表，我们就可以直接找出造成阻塞的 process id，把这个连接用 kill 命令断开即可。
+
+![image-20210221163755400](MySQL.assets/image-20210221163755400.png)
+
+**等 flush**
+
+```mysql
+mysql> select * from information_schema.processlist where id=1;
+```
+
+![image-20210221164023256](MySQL.assets/image-20210221164023256.png)
+
+> 这个线程的状态是 Waiting for table flush
+>
+> 这个状态表示的是，现在有一个线程正要对表 t 做 flush 操作。
+
+```mysql
+-- MySQL 里面对表做 flush 操作的用法，一般有以下两个：
+flush tables t with read lock;
+flush tables with read lock;
+-- 这两个 flush 语句，如果指定表 t 的话，代表的是只关闭表 t；如果没有指定具体的表名，则表示关闭 MySQL 里所有打开的表。
+-- 但是正常这两个语句执行起来都很快，除非它们也被别的线程堵住了。
+-- 所以，出现 Waiting for table flush 状态的可能情况是：有一个 flush tables 命令被别的语句堵住了，然后它又堵住了我们的 select 语句。
+```
+
+![image-20210221164159040](MySQL.assets/image-20210221164159040.png)
+
+> 在 session A 中，我故意每行都调用一次 sleep(1)，这样这个语句默认要执行 10 万秒，在这期间表 t 一直是被 session A“打开”着。然后，session B 的 flush tables t 命令再要去关闭表 t，就需要等 session A 的查询结束。这样，session C 要再次查询的话，就会被 flush 命令堵住了。
+
+![image-20210221164320891](MySQL.assets/image-20210221164320891.png)
+
+**等行锁**
+
+```mysql
+mysql> select * from t where id=1 lock in share mode; 
+-- select 语句如果加锁,则当前读
+-- 由于访问 id=1 这个记录时要加读锁，如果这时候已经有一个事务在这行记录上持有一个写锁，我们的 select 语句就会被堵住。
+```
+
+![image-20210221164745390](MySQL.assets/image-20210221164745390.png)
+
+> session A 启动了事务，占有写锁，还不提交，是导致 session B 被堵住的原因。
+
+![image-20210221164757564](MySQL.assets/image-20210221164757564.png)
+
+```mysql
+-- MySQL 5.7 版本，可以通过 sys.innodb_lock_waits 表查到谁占用着写锁
+mysql> select * from t sys.innodb_lock_waits where locked_table='`test`.`t`'\G
+```
+
+### 第二类：查询慢
+
+```mysql
+mysql> select * from t where c=50000 limit 1;
+-- 由于字段 c 上没有索引，这个语句只能走 id 主键顺序扫描，因此需要扫描 5 万行。
+```
+
+查询一行很慢的情况
+
+![image-20210221165700680](MySQL.assets/image-20210221165700680.png)
+
+> session A 先用 start transaction with consistent snapshot 命令启动了一个事务，之后 session B 才开始执行 update 语句。
+
+![image-20210221165742516](MySQL.assets/image-20210221165742516.png)
+
+> session A 第一个查询语句很慢
+>
+> session A 第二个查询语句很快
+>
+> session B 更新完 100 万次，生成了 100 万个回滚日志 (undo log)。
+>
+> 带 lock in share mode 的 SQL 语句，是当前读，因此会直接读到 1000001 这个结果，所以速度很快；而 select * from t where id=1 这个语句，是一致性读，因此需要从 1000001 开始，依次执行 undo log，执行了 100 万次以后，才将 1 这个结果返回。
+
+## 幻读是什么，幻读有什么问题？
+
+```mysql
+CREATE TABLE `t` (
+    `id` int(11) NOT NULL,
+    `c` int(11) DEFAULT NULL,
+    `d` int(11) DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `c` (`c`)
+) ENGINE=InnoDB;
+
+insert into t values(0,0,0),(5,5,5),
+(10,10,10),(15,15,15),(20,20,20),(25,25,25);
+
+-- 下面的语句序列，是怎么加锁的，加的锁又是什么时候释放的呢？
+begin;
+select * from t where d=5 for update;
+commit;
+-- 比较好理解的是，这个语句会命中 d=5 的这一行，对应的主键 id=5，因此在 select 语句执行完成后，id=5 这一行会加一个写锁，而且由于两阶段锁协议，这个写锁会在执行 commit 语句的时候释放。
+-- 由于字段 d 上没有索引，因此这条查询语句会做全表扫描。那么，其他被扫描到的，但是不满足条件的 5 行记录上，会不会被加锁呢？
+```
+
+InnoDB 的默认事务隔离级别是可重复读
+
+### 幻读是什么？
+
+幻读指的是一个事务在前后两次查询同一个范围的时候，后一次查询看到了前一次查询没有看到的行。
+
+在同一个事务中，两次读取到的数据不一致的情况称为幻读和不可重复读。**幻读是针对insert导致的数据不一致**，**不可重复读是针对 delete、update导致的数据不一致**。
+
+> 如果只在 id=5 这一行加锁，而其他行的不加锁的情况
+
+![image-20210221175841173](MySQL.assets/image-20210221175841173.png)
+
+```markdown
+- 在可重复读隔离级别下，普通的查询是快照读，是不会看到别的事务插入的数据的。因此，幻读在“当前读”下才会出现。
+- 上面 session B 的修改结果，被 session A 之后的 select 语句用“当前读”看到，不能称为幻读。幻读仅专指“新插入的行”。
+- - 当前读指的是select for update或者select in share mode，指的是在更新之前必须先查寻当前的值，因此叫当前读。 快照读指的是在语句执行之前或者在事务开始的时候会创建一个视图，后面的读都是基于这个视图的，不会再去查询最新的值。
+```
+
+### 幻读有什么问题？
+
+> 假设 session A 声明说“要给 d=5 的语句加上锁”，就是为了要更新数据，新加的这条 update 语句就是把它认为加上了锁的这一行的 d 值修改成了 100。
+
+![image-20210221181400095](MySQL.assets/image-20210221181400095.png)
+
+```mysql
+-- binlog里的内容
+update t set d=5 where id=0; /*(0,0,5)*/
+update t set c=5 where id=0; /*(0,5,5)*/
+
+insert into t values(1,1,5); /*(1,1,5)*/
+update t set c=5 where id=1; /*(1,5,5)*/
+
+update t set d=100 where d=5;/*所有d=5的行，d改成100*/
+-- binlog的时序出来的结果和实际表里不一致
+-- 因为事务提交顺序的不同，binlog写入的顺序也不同，那么就可能造成更新的混乱。
+```
+
+> 假设我们把扫描过程中碰到的行，也都加上写锁，再来看看执行效果。
+
+![image-20210221181650539](MySQL.assets/image-20210221181650539.png)
+
+> 由于 session A 把所有的行都加了写锁，所以 session B 在执行第一个 update 语句的时候就被锁住了。需要等到 T6 时刻 session A 提交以后，session B 才能继续执行。
+
+```mysql
+-- 在 binlog 里面，执行序列是这样的：
+insert into t values(1,1,5); /*(1,1,5)*/
+update t set c=5 where id=1; /*(1,5,5)*/
+
+update t set d=100 where d=5;/*所有d=5的行，d改成100*/
+
+update t set d=5 where id=0; /*(0,0,5)*/
+update t set c=5 where id=0; /*(0,5,5)*/
+-- id=1 这一行，在数据库里面的结果是 (1,5,5)，而根据 binlog 的执行结果是 (1,5,100)，也就是说幻读的问题还是没有解决。
+-- 原因很简单。在 T3 时刻，我们给所有行加锁的时候，id=1 这一行还不存在，不存在也就加不上锁。
+```
+
+### 如何解决幻读？
+
+为了解决幻读问题，InnoDB 只好引入新的锁，也就是**间隙锁 (Gap Lock)**。
+
+顾名思义，间隙锁，锁的就是两个值之间的空隙。比如文章开头的表 t，初始化插入了 6 个记录，这就产生了 7 个间隙。
+
+这样，当你执行 select * from t where d=5 for update 的时候，就不止是给数据库中已有的 6 个记录加上了行锁，还同时加了 7 个间隙锁。这样就确保了无法再插入新的记录。
+
+跟间隙锁存在冲突关系的，是“往这个间隙中插入一个记录”这个操作。间隙锁之间都不存在冲突关系。如果没有插入insert操作，就仿佛没有加，不影响并发。
+
+```markdown
+- 间隙锁和行锁合称 next-key lock，每个 next-key lock 是前开后闭区间。也就是说，我们的表 t 初始化以后，如果用 select * from t for update 要把整个表所有记录锁起来，就形成了 7 个 next-key lock，分别是 (-∞,0]、(0,5]、(5,10]、(10,15]、(15,20]、(20, 25]、(25, +supremum]。
+- 我们把间隙锁记为开区间，把 next-key lock 记为前开后闭区间。
+```
+
+死锁问题
+
+![image-20210221184527180](MySQL.assets/image-20210221184527180.png)
+
+```markdown
+- 1.session A 执行 select … for update 语句，由于 id=9 这一行并不存在，因此会加上间隙锁 (5,10);
+- 2.session B 执行 select … for update 语句，同样会加上间隙锁 (5,10)，间隙锁之间不会冲突，因此这个语句可以执行成功；
+- 3.session B 试图插入一行 (9,9,9)，被 session A 的间隙锁挡住了，只好进入等待；
+- 4.session A 试图插入一行 (9,9,9)，被 session B 的间隙锁挡住了。
+```
+
+**间隙锁是在可重复读隔离级别下才会生效的**。所以，你如果把**隔离级别设置为读提交的话，就没有间隙锁了**。但同时，你要解决可能出现的数据和日志不一致问题，需要把 binlog(binlog_format=row) 格式设置为 row。这，也是现在不少公司使用的配置组合。
+
+## 为什么我只改一行的语句，锁这么多？
+
+没有特殊说明，默认是可重复读隔离级别。
+
+```markdown
+# 加锁规则,包含了两个“原则”、两个“优化”和一个“bug”。
+- 原则 1：加锁的基本单位是 next-key lock。next-key lock 是前开后闭区间。
+- 原则 2：查找过程中访问到的对象才会加锁。
+- 优化 1：索引上的等值查询，给唯一索引加锁的时候，next-key lock 退化为行锁。
+- 优化 2：索引上的等值查询，向右遍历时且最后一个值不满足等值条件的时候，next-key lock 退化为间隙锁。
+- 一个 bug：唯一索引上的范围查询会访问到不满足条件的第一个值为止。
+```
+
+```mysql
+-- 建表t
+CREATE TABLE `t` (
+    `id` int(11) NOT NULL,
+    `c` int(11) DEFAULT NULL,
+    `d` int(11) DEFAULT NULL,
+    PRIMARY KEY (`id`),
+    KEY `c` (`c`)
+) ENGINE=InnoDB;
+
+insert into t values(0,0,0),(5,5,5),
+(10,10,10),(15,15,15),(20,20,20),(25,25,25);
+```
+
+### 案例一：等值查询间隙锁
+
+![image-20210221203435646](MySQL.assets/image-20210221203435646.png)
+
+```markdown
+# 表 t 中没有 id=7 的记录
+- 根据原则 1，加锁单位是 next-key lock，session A 加锁范围就是 (5,10]；
+- 同时根据优化 2，这是一个等值查询 (id=7)，而 id=10 不满足查询条件，next-key lock 退化成间隙锁，因此最终加锁的范围是 (5,10)。
+- 所以，session B 要往这个间隙里面插入 id=8 的记录会被锁住，但是 session C 修改 id=10 这行是可以的。
+```
+
+### 案例二：非唯一索引等值锁
+
+![image-20210221204221072](MySQL.assets/image-20210221204221072.png)
+
+```markdown
+# 这里 session A 要给索引 c 上 c=5 的这一行加上读锁。
+- 1.根据原则 1，加锁单位是 next-key lock，因此会给索引c (0,5]加上 next-key lock。
+- 2.要注意 c 是普通索引，因此仅访问 c=5 这一条记录是不能马上停下来的，需要向右遍历，查到 c=10 才放弃。根据原则 2，访问到的都要加锁，因此要给 (5,10]加 next-key lock。
+- 3.但是同时这个符合优化 2：等值判断，向右遍历，最后一个值不满足 c=5 这个等值条件，因此退化成间隙锁 (5,10)。
+- 4.根据原则 2 ，只有访问到的对象才会加锁，这个查询使用覆盖索引，并不需要访问主键索引，所以主键索引上没有加任何锁，这就是为什么 session B 的 update 语句可以执行完成。
+- for update: 会顺便给主键索引加锁 
+- in shared mode: 如果有覆盖索引优化，没有访问到主键索引，那么主键索引就不会加锁
+```
+
+### 案例三：主键索引范围锁
+
+![image-20210221210648198](MySQL.assets/image-20210221210648198.png)
+
+```markdown
+- 开始执行的时候，要找到第一个 id=10 的行，因此本该是 next-key lock(5,10]。 根据优化 1， 主键 id 上的等值条件，退化成行锁，只加了 id=10 这一行的行锁。
+- 范围查找就往后继续找，找到 id=15 这一行停下来，因此需要加 next-key lock(10,15]。
+- 这里你需要注意一点，首次 session A 定位查找 id=10 的行的时候，是当做等值查询来判断的，而向右扫描到 id=15 的时候，用的是范围查询判断。
+```
+
+### 案例四：非唯一索引范围锁
+
+![image-20210221210921104](MySQL.assets/image-20210221210921104.png)
+
+```markdown
+- 加锁规则跟案例三唯一的不同是：在第一次用 c=10 定位记录的时候，索引 c 上加了 (5,10]这个 next-key lock 后，由于索引 c 是非唯一索引，没有优化规则，也就是说不会蜕变为行锁，因此最终 sesion A 加的锁是，索引 c 上的 (5,10] 和 (10,15] 这两个 next-key lock。
+```
+
+### 案例五：唯一索引范围锁 bug
+
+![image-20210221211124898](MySQL.assets/image-20210221211124898.png)
+
+```markdown
+- session A 是一个范围查询，按照原则 1 的话，应该是索引 id 上只加 (10,15]这个 next-key lock，并且因为 id 是唯一键，所以循环判断到 id=15 这一行就应该停止了。
+- 但是实现上，InnoDB 会往前扫描到第一个不满足条件的行为止，也就是 id=20。而且由于这是个范围扫描，因此索引 id 上的 (15,20]这个 next-key lock 也会被锁上。
+- 高版本已解决这个bug了
+```
+
+### 案例六：非唯一索引上存在"等值"的例子
+
+```mysql
+mysql> insert into t values(30,10,30);
+-- 新插入的这一行 c=10，也就是说现在表里有两个 c=10 的行。由于非唯一索引上包含主键的值，所以是不可能存在“相同”的两行的。
+```
+
+虽然有两个 c=10，但是它们的主键值 id 是不同的（分别是 10 和 30），因此这两个 c=10 的记录之间，也是有间隙的。
+
+delete 语句会给主键也加锁
+
+![image-20210221211555190](MySQL.assets/image-20210221211555190.png)
+
+```markdown
+- 这时，session A 在遍历的时候，先访问第一个 c=10 的记录。同样地，根据原则 1，这里加的是 (c=5,id=5) 到 (c=10,id=10) 这个 next-key lock。
+- 然后，session A 向右查找，直到碰到 (c=15,id=15) 这一行，循环才结束。根据优化 2，这是一个等值查询，向右查找到了不满足条件的行，所以会退化成 (c=10,id=10) 到 (c=15,id=15) 的间隙锁。
+```
+
+### 案例七：limit 语句加锁
+
+![image-20210221212850372](MySQL.assets/image-20210221212850372.png)
+
+```markdown
+- 这个例子里，session A 的 delete 语句加了 limit 2。你知道表 t 里 c=10 的记录其实只有两条，因此加不加 limit 2，删除的效果都是一样的，但是加锁的效果却不同。可以看到，session B 的 insert 语句执行通过了，跟案例六的结果不同。
+- 这是因为，案例七里的 delete 语句明确加了 limit 2 的限制，因此在遍历到 (c=10, id=30) 这一行之后，满足条件的语句已经有两条，循环就结束了。
+- 因此，索引 c 上的加锁范围就变成了从（c=5,id=5) 到（c=10,id=30) 这个前开后闭区间
+```
+
+### 案例八：一个死锁的例子
+
+![image-20210221213218008](MySQL.assets/image-20210221213218008.png)
+
+```markdown
+- session A 启动事务后执行查询语句加 lock in share mode，在索引 c 上加了 next-key lock(5,10] 和间隙锁 (10,15)；
+- session B 的 update 语句也要在索引 c 上加 next-key lock(5,10] ，进入锁等待；
+- 然后 session A 要再插入 (8,8,8) 这一行，被 session B 的间隙锁锁住。由于出现了死锁，InnoDB 让 session B 回滚。
+- session B 的“加 next-key lock(5,10] ”操作，实际上分成了两步，先是加 (5,10) 的间隙锁，加锁成功；然后加 c=10 的行锁，这时候才被锁住的。
+```
+
